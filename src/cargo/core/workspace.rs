@@ -21,8 +21,8 @@ use crate::util::errors::{CargoResult, CargoResultExt, ManifestError};
 use crate::util::interning::InternedString;
 use crate::util::paths;
 use crate::util::toml::{
-    map_deps, read_manifest, StringOrBool, TomlDependency, TomlProfiles, TomlWorkspace,
-    VecStringOrBool,
+    map_deps, parse_manifest, read_manifest, StringOrBool, TomlDependency, TomlManifest,
+    TomlProfiles, TomlWorkspace, VecStringOrBool,
 };
 use crate::util::{Config, Filesystem};
 
@@ -103,6 +103,7 @@ pub struct Workspace<'cfg> {
 struct Packages<'cfg> {
     config: &'cfg Config,
     packages: HashMap<PathBuf, MaybePackage>,
+    manifests: HashMap<PathBuf, (Rc<TomlManifest>, BTreeSet<String>)>,
 }
 
 #[derive(Debug)]
@@ -121,6 +122,15 @@ pub enum WorkspaceConfig {
     /// Indicates that `[workspace]` was present and the `root` field is the
     /// optional value of `package.workspace`, if present.
     Member { root: Option<String> },
+}
+
+impl WorkspaceConfig {
+    pub fn is_root(&self) -> bool {
+        match self {
+            Self::Root(_) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Intermediate configuration of a workspace root in a manifest.
@@ -180,6 +190,7 @@ impl<'cfg> Workspace<'cfg> {
             ws.root_manifest = ws.find_root(manifest_path)?;
         }
 
+        ws.load_current()?;
         ws.custom_metadata = ws
             .load_workspace_config()?
             .and_then(|cfg| cfg.custom_metadata);
@@ -199,6 +210,7 @@ impl<'cfg> Workspace<'cfg> {
             packages: Packages {
                 config,
                 packages: HashMap::new(),
+                manifests: HashMap::new(),
             },
             root_manifest: None,
             target_dir: None,
@@ -265,6 +277,11 @@ impl<'cfg> Workspace<'cfg> {
         ws.member_ids.insert(id);
         ws.default_members.push(ws.current_manifest.clone());
         Ok(ws)
+    }
+
+    fn load_current(&mut self) -> CargoResult<()> {
+        self.packages.load(&self.current_manifest)?;
+        Ok(())
     }
 
     /// Returns the current package of this workspace.
@@ -433,7 +450,7 @@ impl<'cfg> Workspace<'cfg> {
         // metadata.
         if let Some(root_path) = &self.root_manifest {
             let root_package = self.packages.load(root_path)?;
-            match root_package.workspace_config() {
+            match root_package.workspace_config().as_ref() {
                 WorkspaceConfig::Root(ref root_config) => {
                     return Ok(Some(root_config.clone()));
                 }
@@ -469,8 +486,7 @@ impl<'cfg> Workspace<'cfg> {
         };
 
         {
-            let current = self.packages.load(manifest_path)?;
-            match *current.workspace_config() {
+            match self.packages.shallow_load(manifest_path)?.as_ref() {
                 WorkspaceConfig::Root(_) => {
                     debug!("find_root - is root {}", manifest_path.display());
                     return Ok(Some(manifest_path.to_path_buf()));
@@ -490,7 +506,7 @@ impl<'cfg> Workspace<'cfg> {
             let ances_manifest_path = path.join("Cargo.toml");
             debug!("find_root - trying {}", ances_manifest_path.display());
             if ances_manifest_path.exists() {
-                match *self.packages.load(&ances_manifest_path)?.workspace_config() {
+                match self.packages.shallow_load(&ances_manifest_path)?.as_ref() {
                     WorkspaceConfig::Root(ref ances_root_config) => {
                         debug!("find_root - found a root checking exclusion");
                         if !ances_root_config.is_excluded(manifest_path) {
@@ -711,7 +727,7 @@ impl<'cfg> Workspace<'cfg> {
             .iter()
             .filter(|&member| {
                 let config = self.packages.get(member).workspace_config();
-                matches!(config, WorkspaceConfig::Root(_))
+                matches!(config.as_ref(), WorkspaceConfig::Root(_))
             })
             .map(|member| member.parent().unwrap().to_path_buf())
             .collect();
@@ -1126,11 +1142,11 @@ impl<'cfg> Packages<'cfg> {
     }
 
     fn load(&mut self, manifest_path: &Path) -> CargoResult<&MaybePackage> {
-        let key = manifest_path.parent().unwrap();
-        match self.packages.entry(key.to_path_buf()) {
+        let key = Self::key_for(manifest_path);
+        match self.packages.entry(key.clone()) {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(v) => {
-                let source_id = SourceId::for_path(key)?;
+                let source_id = SourceId::for_path(&key)?;
                 let (manifest, _nested_paths) =
                     read_manifest(manifest_path, source_id, self.config)?;
                 Ok(v.insert(match manifest {
@@ -1141,6 +1157,29 @@ impl<'cfg> Packages<'cfg> {
                 }))
             }
         }
+    }
+
+    #[allow(unused)]
+    fn shallow_load(&mut self, manifest_path: &Path) -> CargoResult<Rc<WorkspaceConfig>> {
+        let key = Self::key_for(manifest_path);
+
+        if let Some(maybe_package) = self.packages.get(&key) {
+            return Ok(maybe_package.workspace_config());
+        }
+
+        let toml_manifest = match self.manifests.entry(key.clone()) {
+            Entry::Occupied(e) => e.get().0.clone(),
+            Entry::Vacant(v) => {
+                let result = parse_manifest(manifest_path, self.config)?;
+                v.insert(result).0.clone()
+            }
+        };
+
+        Ok(Rc::new(toml_manifest.workspace_config(&key, self.config)?))
+    }
+
+    fn key_for(manifest_path: &Path) -> PathBuf {
+        manifest_path.parent().unwrap().to_path_buf()
     }
 }
 
@@ -1165,7 +1204,7 @@ impl<'a, 'cfg> Iterator for Members<'a, 'cfg> {
 }
 
 impl MaybePackage {
-    fn workspace_config(&self) -> &WorkspaceConfig {
+    fn workspace_config(&self) -> Rc<WorkspaceConfig> {
         match *self {
             MaybePackage::Package(ref p) => p.manifest().workspace_config(),
             MaybePackage::Virtual(ref vm) => vm.workspace_config(),
