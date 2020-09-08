@@ -38,10 +38,15 @@ fn permit_additional_workspace_fields() {
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
+    Package::new("dep", "0.1.2").publish();
     p.cargo("build")
         // Should not warn about unused fields.
         .with_stderr(
             "\
+[UPDATING] `[..]` index
+[DOWNLOADING] crates ...
+[DOWNLOADED] dep v0.1.2 ([..])
+[COMPILING] dep v0.1.2
 [COMPILING] bar v0.1.0 ([CWD]/bar)
 [FINISHED] dev [unoptimized + debuginfo] target(s) in [..]
 ",
@@ -50,7 +55,7 @@ fn permit_additional_workspace_fields() {
 
     p.cargo("check").run();
     let lockfile = p.read_lockfile();
-    assert!(!lockfile.contains("dep"));
+    assert!(lockfile.contains("dep"));
 }
 
 #[cargo_test]

@@ -1698,6 +1698,19 @@ impl DefinedTomlManifest {
                 Ok(())
             }
 
+            // Collect the workspace's [workspace.dependencies], if any.
+            let output = find_workspace_root(manifest_file, config)?
+                .map(|root_path| parse_manifest(&root_path, config))
+                .transpose()?;
+
+            let workspace = output.as_ref().and_then(|ws| ws.workspace());
+
+            process_dependencies(
+                &mut cx,
+                workspace.and_then(|ws| ws.dependencies.as_ref()),
+                None,
+            )?;
+
             // Collect the dependencies.
             process_dependencies(&mut cx, me.dependencies.as_ref(), None)?;
             let dev_deps = me.dev_dependencies.as_ref();
